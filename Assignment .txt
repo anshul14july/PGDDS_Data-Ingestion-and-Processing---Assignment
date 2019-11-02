@@ -1,0 +1,179 @@
+-- IMPORTANT: BEFORE CREATING ANY TABLE, MAKE SURE YOU RUN THIS COMMAND 
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+drop table if exists nyc_taxi_table
+
+-- CREATE EXTERNAL TABLE 
+create external table if not exists nyc_taxi_table(VendorID string,
+tpep_pickup_datetime timestamp,
+tpep_dropoff_datetime timestamp,
+passenger_count int,
+trip_distance double,
+RatecodeID int,
+store_and_fwd_flag string,
+PULocationID int,
+DOLocationID int,
+payment_type int,
+fare_amount double,
+extra double,
+mta_tax double,
+tip_amount double,
+tolls_amount double,
+improvement_surcharge double,
+total_amount double)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+location '/common_folder/nyc_taxi_data/'
+tblproperties ("skip.header.line.count"="1");
+
+select * from nyc_taxi_table limit 10;
+
+select  month(tpep_dropoff_datetime),count(*) from nyc_taxi_table
+group by month(tpep_dropoff_datetime);
+
+select  month(tpep_pickup_datetime),count(*) from nyc_taxi_table
+group by month(tpep_pickup_datetime);
+
+
+select count(*) from nyc_taxi_table where month(tpep_pickup_datetime) in  (11,12) and month(tpep_dropoff_datetime) in (11,12) ;
+
+select VendorID, count(*) from nyc_taxi_table
+group by VendorID;
+-- We'll be considering all the trips where the trip distance is greater than 0 
+-- Since only for those trips data can be validated 
+select count(*) from nyc_taxi_table where trip_distance = 0
+
+select tpep_pickup_datetime,tpep_dropoff_datetime,case when tpep_dropoff_datetime = tpep_pickup_datetime then 0 else 1 end as Difference from nyc_taxi_table where trip_distance = 0 limit 100;
+
+-- Zero passengers provided by Creative Mobile Technologies, LLC
+-- Also more than 5 passengers ( 6 in case of child, less than 7 years old) not allowed so anything above 6 passenger count is error in record 
+-- Under Driver Rule 54-15(g)  Chapter 54 - Drivers of Taxicabs and Street Hail Liveries
+select Passenger_count,VendorID,
+count(*) from nyc_taxi_table 
+group by Passenger_count,VendorID
+
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+-- First drop the table 
+drop table nyc_taxi_month_day_partition_orc;
+
+-- ORC FILE FORMAT 
+-- This format improves query performance 
+
+-- First, create ORC table 
+create external table if not exists nyc_taxi_month_day_partition_orc
+(VendorID string,
+tpep_pickup_datetime timestamp,
+tpep_dropoff_datetime timestamp,
+passenger_count int,
+trip_distance double,
+RatecodeID int,
+store_and_fwd_flag string,
+PULocationID int,
+DOLocationID int,
+payment_type int,
+fare_amount double,
+extra double,
+mta_tax double,
+tip_amount double,
+tolls_amount double,
+improvement_surcharge double,
+total_amount double) partitioned by (mnth int, day int)
+stored as orc location '/user/hive/warehouse/onepanman'
+tblproperties ("orc.compress"="SNAPPY");
+
+
+-- Then insert the data in the table 
+insert overwrite table nyc_taxi_month_day_partition_orc partition(mnth, day)
+select * , month(tpep_pickup_datetime) as mnth, day(tpep_pickup_datetime) as day
+from nyc_taxi_table where month(tpep_pickup_datetime) in  (11,12) and month(tpep_dropoff_datetime) in (11,12) and Passenger_count > 0 and Passenger_count<7 
+and year(tpep_dropoff_datetime) = 2017 and year(tpep_pickup_datetime) = 2017 and trip_distance > 0  
+
+
+Analysis I
+
+select mnth,avg(Fare_amount) as average_fare_per_trip
+from nyc_taxi_month_day_partition_orc
+group by mnth;
+
+select mnth,avg(Total_amount) as average_fare_per_trip
+from nyc_taxi_month_day_partition_orc
+group by mnth;
+-- Average fare trip is maximum for the November month including all the extras charged with tolls and tips included.
+
+
+select Passenger_count, count(*) as Trips
+from nyc_taxi_month_day_partition_orc
+group by Passenger_count;
+--Quite obvious from the data present that most people prefer travelling alone.
+
+
+select payment_type
+,count(*) 
+from nyc_taxi_month_day_partition_orc
+group by payment_type
+-- Credit Card being the most favourable mode of payment.
+
+select avg(Tip_amount) as Tip_Amount from nyc_taxi_month_day_partition_orc
+where Payment_type <> 2 and Tip_amount <> 0
+
+
+select percentile_approx(Tip_amount,0.25) as 25th_percentile
+,percentile_approx(Tip_amount,0.5) as 50th_percentile
+,percentile_approx(Tip_amount,0.75) as 75th_percentile
+,avg(Tip_amount) as Avg_Tip_Amount
+from nyc_taxi_month_day_partition_orc
+where Payment_type <> 2
+and Tip_amount <> 0
+-- Average Tip is not the exact representative statistic (of the central tendency) of tip amount paid.
+-- This can be mainly due to outliers present in the data or the data skewed towards higher tip amount being paid.
+
+
+select count(case when Extra <> 0 then Extra end)/count(*) from nyc_taxi_month_day_partition_orc
+-- 46% of total trips have extra charges levied.
+
+Analysis II
+
+select corr(passenger_count, Tip_amount)
+from nyc_taxi_month_day_partition_orc
+where Tip_amount <> 0
+and Payment_type <> 2
+
+select passenger_count, avg(Tip_amount) as Average_Tip_Amount
+from nyc_taxi_month_day_partition_orc
+where Tip_amount <> 0
+and Payment_type <> 2
+group by passenger_count
+-- Correlation between passenger counts and average tip amount is very low although its positive so we can say that with increase in pasengers 
+-- , tip amount also increases which can also be seen from the average tip amount grouped by passengers. Also multiple travellers tip more compared to solo travellers
+
+
+select 
+count(case when Tip_amount >= 0 and Tip_amount< 5 then Tip_amount end)*100.0/count(*) as  0_5
+,count(case when Tip_amount >= 5 and Tip_amount< 10 then Tip_amount end)*100.0/count(*) as  5_10
+,count(case when Tip_amount >= 10 and Tip_amount< 15 then Tip_amount end)*100.0/count(*) as  10_15
+,count(case when Tip_amount >= 15 and Tip_amount< 20 then Tip_amount end)*100.0/count(*) as  15_20
+,count(case when Tip_amount >= 20 then Tip_amount end)*100.0/count(*) as  Greater_Than_Equal_20
+from nyc_taxi_month_day_partition_orc
+where Tip_amount <> 0
+and Payment_type <> 2;
+--First bucket of 0 to 5 $ tip has maximum number of consumers.
+
+
+select mnth,avg(Trip_distance*3600/((unix_timestamp(tpep_dropoff_datetime) 
+      - unix_timestamp(tpep_pickup_datetime)))) as Avg_Speed
+from nyc_taxi_month_day_partition_orc 
+where trip_distance <> 0 
+group by mnth
+--Average speed of both these months are quite comparable with December slightly rising up.
+
+
+select case when day in (25,31) and mnth = 12 then 'Happening_days'
+else 'Normal_Days' end as Days,avg(Trip_distance*3600/((unix_timestamp(tpep_dropoff_datetime) 
+      - unix_timestamp(tpep_pickup_datetime)))) as Avg_Speed
+from nyc_taxi_month_day_partition_orc 
+where trip_distance <> 0 
+group by case when day in (25,31) and mnth = 12 then 'Happening_days'
+else 'Normal_Days' end
+--Average Speed in Happening Days like Holidays are comparetively higher than the normal days,
+--One of the reason behind it can be much higher number of trips being made on those days.
